@@ -1,0 +1,13 @@
+bin/
+obj/
+Data/
+.appdata/
+.dotnet-home/
+.nuget/
+.vs/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.user
+*.suo

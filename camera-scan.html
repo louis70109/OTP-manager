@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SecureKey · QR 掃描</title>
+  <style>
+    :root{color-scheme:dark;--bg:#101426;--panel:#1a2035;--muted:#a1a8bf;--accent:#9288ff;--line:#303750}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 50% -15%,#34315f 0,transparent 48%),var(--bg);color:#f6f7fb;font:15px/1.5 "Segoe UI",system-ui,sans-serif;display:grid;place-items:center;padding:26px}
+    .card{width:min(680px,100%);background:rgba(26,32,53,.96);border:1px solid var(--line);border-radius:24px;padding:28px;box-shadow:0 24px 80px #080b1680}
+    .brand{display:flex;align-items:center;gap:12px;margin-bottom:22px}.mark{width:42px;height:42px;border-radius:14px;background:#5549df;display:grid;place-items:center;font-size:23px}.brand strong{display:block;font-size:16px}.brand small{color:var(--muted);font-size:10px;letter-spacing:.12em}
+    .title{font-size:24px;margin:0 0 4px}.sub{color:var(--muted);margin:0 0 20px}.controls{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+    select,button{font:inherit;color:#f7f7fb;background:#252c43;border:1px solid #3b4361;border-radius:11px;padding:11px 13px}select{flex:1;min-width:190px}button{cursor:pointer;background:#6357e8;border-color:#6357e8;font-weight:650}button.secondary,.file-button{background:#252c43;border-color:#3b4361;color:#e4e6f2}.file-button{display:inline-flex;align-items:center;justify-content:center;font:inherit;border:1px solid #3b4361;border-radius:11px;padding:11px 13px;cursor:pointer;font-weight:650}.file-input{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;clip-path:inset(50%)}button:disabled,.file-button.disabled{opacity:.55;cursor:default}
+    .view{position:relative;overflow:hidden;border-radius:17px;background:#0a0d17;aspect-ratio:16/10;display:grid;place-items:center;border:1px solid #333b53}video{width:100%;height:100%;object-fit:cover}.frame{position:absolute;width:min(66%,430px);aspect-ratio:1;border:2px solid #a59cff;border-radius:24px;box-shadow:0 0 0 999px #090c176e;pointer-events:none}.placeholder{position:absolute;color:#9aa2ba;text-align:center;padding:20px}
+    .status{min-height:26px;margin:14px 2px 0;color:#d0d4e1;font-size:14px;font-weight:600}.status.working{color:#c9c5ff}.status.success{color:#9be7bd}.status.error{color:#ffb4b4}
+    .tips{background:#20263b;border:1px solid #303750;border-radius:14px;padding:13px 15px;margin-top:14px;color:#aeb5ca;font-size:12px}.tips b{color:#e5e6ef}.privacy{border-top:1px solid var(--line);padding-top:15px;margin-top:15px;color:#8f97af;font-size:11px}.privacy b{color:#c9c5ff}
+    @media(max-width:560px){body{padding:12px}.card{padding:19px}.controls{display:grid;grid-template-columns:1fr 1fr}select{grid-column:1/-1}.frame{width:72%}}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="brand"><div class="mark">✦</div><div><strong>SecureKey</strong><small>PRIVATE QR SCANNER</small></div></div>
+    <h1 class="title">掃描驗證器 QR Code</h1>
+    <p class="sub">選好相機並允許存取。把完整 QR Code 放進取景框；辨識完成後，資料會自動送回 OTP Manager。</p>
+    <div class="controls">
+      <select id="cameras" aria-label="選擇相機" disabled><option>允許相機後即可選擇裝置</option></select>
+      <button id="start">啟用相機</button>
+      <button id="stop" disabled>停止相機</button>
+      <button id="pickImage" class="secondary" type="button">從圖片掃描 QR</button>
+      <input id="imageFile" class="file-input" type="file" accept="image/*" aria-label="選擇驗證器 QR 圖片">
+    </div>
+    <div class="view"><video id="video" autoplay muted playsinline></video><div class="frame"></div><div class="placeholder" id="placeholder">啟用相機後，畫面會顯示在這裡</div></div>
+    <div class="status" id="status" role="status" aria-live="polite">按「啟用相機」並允許權限後開始。</div>
+    <div class="tips"><b>掃描小技巧</b><br>請使用驗證器的「匯出帳戶」QR Code，而非一般登入 QR Code。完整照到四個角、保持平整和對焦；降低手機螢幕亮度、稍微傾斜避開反光，或改用「從圖片掃描 QR」。辨識到後會顯示「掃描完成」，並在 OTP Manager 出現帳戶預覽。</div>
+    <div class="privacy"><b>隱私保護。</b>影像只在瀏覽器本機處理。若瀏覽器沒有內建 QR 支援，會從 jsDelivr 載入 QR 解碼器；只有辨識出的驗證器資料會送回這台裝置上的 OTP Manager。</div>
+  </main>
+  <script>
+    const video=document.querySelector('#video');
+    const cameras=document.querySelector('#cameras');
+    const start=document.querySelector('#start');
+    const stopButton=document.querySelector('#stop');
+    const pickImage=document.querySelector('#pickImage');
+    const imageFile=document.querySelector('#imageFile');
+    const status=document.querySelector('#status');
+    const placeholder=document.querySelector('#placeholder');
+    let stream=null,detector=null,looping=false,busy=false,canvas=null,canvasContext=null,lastQrNotice=0;
+    const supportedQr=/^(?:otpauth:\/\/totp\/|otpauth-migration:\/\/offline\?data=)/i;
+    function setStatus(message,kind=''){status.textContent=message;status.className=`status ${kind}`.trim()}
+    function stop(){looping=false;if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}video.srcObject=null;placeholder.hidden=false;stopButton.disabled=true}
+    async function loadJsQr(){
+      if(window.jsQR)return;
+      setStatus('正在載入相容 QR 解碼器…','working');
+      await new Promise((resolve,reject)=>{const script=document.createElement('script');script.src='https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js';script.crossOrigin='anonymous';script.referrerPolicy='no-referrer';script.onload=resolve;script.onerror=()=>reject(new Error('載入 QR 解碼器失敗。請確認網路連線後再試。'));document.head.append(script)});
+      if(!window.jsQR)throw new Error('QR 解碼器無法啟動，請再試一次。');
+    }
+    async function prepareDecoder(){
+      detector=null;
+      try{if('BarcodeDetector'in window){const formats=await BarcodeDetector.getSupportedFormats();if(formats.includes('qr_code')){detector=new BarcodeDetector({formats:['qr_code']});return}}}catch(e){}
+      await loadJsQr();canvas=document.createElement('canvas');canvasContext=canvas.getContext('2d',{willReadFrequently:true});
+      if(!canvasContext)throw new Error('無法建立 QR 掃描畫布。');
+    }
+    async function ensureCanvasDecoder(){
+      await loadJsQr();
+      if(!canvas){canvas=document.createElement('canvas');canvasContext=canvas.getContext('2d',{willReadFrequently:true})}
+      if(!canvasContext)throw new Error('無法建立 QR 掃描畫布。');
+    }
+    async function scanImage(file){
+      if(!file)return;stop();pickImage.disabled=true;setStatus(`正在讀取圖片：${file.name}`,'working');
+      let bitmap=null;
+      try{
+        await prepareDecoder();bitmap=await createImageBitmap(file);let raw=null,seenQr=false;
+        if(detector){try{const hits=await detector.detect(bitmap);seenQr=hits.length>0;raw=hits.find(x=>supportedQr.test(x.rawValue))?.rawValue}catch(e){}}
+        if(!raw){await ensureCanvasDecoder();const scale=Math.min(1,1800/Math.max(bitmap.width,bitmap.height));const width=Math.max(1,Math.round(bitmap.width*scale)),height=Math.max(1,Math.round(bitmap.height*scale));canvas.width=width;canvas.height=height;canvasContext.drawImage(bitmap,0,0,width,height);const hit=window.jsQR(canvasContext.getImageData(0,0,width,height).data,width,height,{inversionAttempts:'attemptBoth'});if(hit){seenQr=true;if(supportedQr.test(hit.data))raw=hit.data}}
+        if(raw){await sendToApp(raw);return}
+        throw new Error(seenQr?'圖片裡有 QR Code，但不是支援的驗證器匯出碼。請使用「匯出帳戶」圖片。':'圖片中沒有辨識到 QR Code。請選擇清晰、完整的 QR 圖片。');
+      }catch(e){setStatus(e.message||'無法讀取圖片。請選擇 PNG 或 JPG 圖片。','error')}
+      finally{if(bitmap)bitmap.close();pickImage.disabled=false;imageFile.value=''}
+    }
+    async function useCamera(deviceId){
+      stop();
+      try{
+        stream=await navigator.mediaDevices.getUserMedia({audio:false,video:deviceId?{deviceId:{exact:deviceId},width:{ideal:1920},height:{ideal:1080}}:{width:{ideal:1920},height:{ideal:1080}}});
+        video.srcObject=stream;await video.play();placeholder.hidden=true;stopButton.disabled=false;
+        const track=stream.getVideoTracks()[0];const label=track?.label||cameras.selectedOptions[0]?.textContent||'相機';
+        setStatus(`${label} 正在掃描中…請將 QR Code 完整放入框內並保持清晰。`,'working');
+        looping=true;scanFrame();
+      }catch(e){setStatus(`相機無法啟動：${e.message||'請確認權限並改選其他相機。'}`,'error')}
+    }
+    async function sendToApp(raw){
+      looping=false;setStatus('已辨識 QR Code，正在傳回 OTP Manager…','working');start.disabled=true;
+      if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;placeholder.hidden=true;stopButton.disabled=true;
+      try{
+        const response=await fetch('/__SCAN_PATH__',{method:'POST',headers:{'Content-Type':'text/plain;charset=UTF-8'},body:raw});
+        if(!response.ok){const message=await response.text();throw new Error(message||`傳回失敗（${response.status}）`)}
+        setStatus('掃描完成！資料已傳回 OTP Manager。請切回應用程式檢查帳戶預覽並按「儲存」。','success');
+      }catch(e){setStatus(`QR 已辨識，但傳回應用程式失敗：${e.message}。請回 OTP Manager 重新開啟掃描。`,'error');start.disabled=false}
+    }
+    async function scanFrame(){
+      if(!looping||busy)return;busy=true;
+      try{
+        if(video.readyState>=2&&video.videoWidth&&video.videoHeight){
+          let raw=null;
+          if(detector){const hits=await detector.detect(video);const hit=hits.find(x=>supportedQr.test(x.rawValue));raw=hit?.rawValue;if(hits.length&&!hit&&Date.now()-lastQrNotice>4000){setStatus('看到 QR Code 但不是支援的驗證器匯出碼；請使用「匯出帳戶」QR Code。','error');lastQrNotice=Date.now()}}
+          else{const width=Math.min(1280,video.videoWidth),height=Math.round(video.videoHeight*width/video.videoWidth);canvas.width=width;canvas.height=height;canvasContext.drawImage(video,0,0,width,height);const hit=window.jsQR(canvasContext.getImageData(0,0,width,height).data,width,height,{inversionAttempts:'attemptBoth'});if(hit){if(supportedQr.test(hit.data))raw=hit.data;else if(Date.now()-lastQrNotice>4000){setStatus('看到 QR Code 但不是支援的驗證器匯出碼；請使用「匯出帳戶」QR Code。','error');lastQrNotice=Date.now()}}}
+          if(raw){await sendToApp(raw);return}
+        }
+      }catch(e){
+        if(detector){detector=null;try{await loadJsQr();canvas=document.createElement('canvas');canvasContext=canvas.getContext('2d',{willReadFrequently:true});setStatus('內建掃描器不可用，已切換相容解碼器，繼續掃描中…','working')}catch(loadError){stop();setStatus(loadError.message||'QR 解碼器無法啟動。','error')}}
+        else{stop();setStatus(`掃描發生錯誤：${e.message||'請重新啟用相機。'}`,'error')}
+      }finally{busy=false}
+      if(looping)setTimeout(scanFrame,220)
+    }
+    start.addEventListener('click',async()=>{
+      start.disabled=true;
+      try{
+        await prepareDecoder();setStatus('請在瀏覽器提示中允許相機存取…','working');
+        const permission=await navigator.mediaDevices.getUserMedia({video:true,audio:false});permission.getTracks().forEach(t=>t.stop());
+        const devices=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput');cameras.innerHTML='';
+        devices.forEach((d,i)=>{const o=document.createElement('option');o.value=d.deviceId;o.textContent=d.label||`相機 ${i+1}`;cameras.append(o)});
+        if(!devices.length)throw new Error('找不到相機，請連接相機後再試。');
+        cameras.disabled=false;start.textContent='重新啟動相機';await useCamera(cameras.value);
+      }catch(e){setStatus(e.message||'無法啟動掃描。請允許相機權限並重試。','error')}
+      finally{start.disabled=false}
+    });
+    cameras.addEventListener('change',()=>useCamera(cameras.value));
+    pickImage.addEventListener('click',()=>imageFile.click());
+    imageFile.addEventListener('change',()=>scanImage(imageFile.files?.[0]));
+    stopButton.addEventListener('click',()=>{stop();setStatus('相機已停止。按「重新啟動相機」即可再掃描。')});
+    window.addEventListener('pagehide',stop);
+  </script>
+</body>
+</html>
