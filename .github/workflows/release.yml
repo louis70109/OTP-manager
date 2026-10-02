@@ -1,0 +1,167 @@
+name: Windows release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
+
+jobs:
+  build:
+    name: Build and smoke-test Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Resolve package version
+        id: version
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            if ($env:GITHUB_REF_NAME -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+              throw 'Release tags must use vMAJOR.MINOR.PATCH without leading zeroes.'
+            }
+            $version = $env:GITHUB_REF_NAME.Substring(1)
+            $label = $env:GITHUB_REF_NAME
+          } else {
+            $version = "0.0.0-ci.$env:GITHUB_RUN_NUMBER"
+            $label = $version
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "label=$label" >> $env:GITHUB_OUTPUT
+
+      - name: Publish self-contained application
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dotnet publish WindowsOtpManager.csproj `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            --source https://api.nuget.org/v3/index.json `
+            --output "$env:RUNNER_TEMP/publish" `
+            -p:Version="$env:APP_VERSION" `
+            -p:ContinuousIntegrationBuild=true `
+            -p:PublishSingleFile=false `
+            -p:PublishTrimmed=false `
+            -p:DebugType=None `
+            -p:DebugSymbols=false
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed.' }
+
+      - name: Package and verify extracted application
+        env:
+          PACKAGE_LABEL: ${{ steps.version.outputs.label }}
+        run: |
+          $assets = New-Item -ItemType Directory -Path "$env:RUNNER_TEMP/assets" -Force
+          $archive = Join-Path $assets.FullName "WindowsOtpManager-$env:PACKAGE_LABEL-win-x64.zip"
+          Compress-Archive -Path "$env:RUNNER_TEMP/publish/*" -DestinationPath $archive
+          $extracted = "$env:RUNNER_TEMP/smoke"
+          Expand-Archive -Path $archive -DestinationPath $extracted
+          foreach ($file in @('WindowsOtpManager.exe', 'WindowsOtpManager.dll', 'WindowsOtpManager.runtimeconfig.json', 'coreclr.dll', 'PresentationFramework.dll', 'camera-scan.html')) {
+            if (-not (Test-Path (Join-Path $extracted $file) -PathType Leaf)) {
+              throw "Release archive is missing $file"
+            }
+          }
+          $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $extracted 'WindowsOtpManager.exe'))
+          Write-Host "Packaged product version: $($version.ProductVersion)"
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $([System.IO.Path]::GetFileName($archive))" | Set-Content (Join-Path $assets.FullName 'SHA256SUMS') -Encoding ascii
+
+      - name: Launch packaged WPF application
+        run: |
+          $extracted = "$env:RUNNER_TEMP/smoke"
+          $app = Start-Process -FilePath (Join-Path $extracted 'WindowsOtpManager.exe') -WorkingDirectory $extracted -PassThru
+          try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+              Start-Sleep -Seconds 1
+              $app.Refresh()
+              if ($app.HasExited) { throw "Application exited during startup: $($app.ExitCode)" }
+            } while ($app.MainWindowHandle -eq 0 -and [DateTime]::UtcNow -lt $deadline)
+            if ($app.MainWindowHandle -eq 0) { throw 'Application did not create its main window.' }
+            Start-Sleep -Seconds 3
+            $app.Refresh()
+            if ($app.HasExited) { throw "Application exited after opening its window: $($app.ExitCode)" }
+            Write-Host "WPF startup smoke test passed: $($app.MainWindowTitle)"
+          } finally {
+            if (-not $app.HasExited) {
+              Stop-Process -Id $app.Id -Force
+              $app.WaitForExit()
+            }
+          }
+
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-x64-release
+          path: ${{ runner.temp }}/assets/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-x64-release
+          path: assets
+
+      - name: Verify checksums and publish release
+        working-directory: assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum --check SHA256SUMS
+          cat > release-notes.md <<EOF
+          ## Install
+          Download \`WindowsOtpManager-${RELEASE_TAG}-win-x64.zip\`, extract the entire archive, and run \`WindowsOtpManager.exe\` on a supported Windows x64 system. The .NET runtime is included.
+
+          ## Integrity
+          Verify the ZIP against the attached \`SHA256SUMS\`. This is an unsigned portable application, not an installer; Windows SmartScreen may show an unknown-publisher warning.
+
+          ## Scope and limitations
+          TOTP generation, URI/Google Authenticator QR import, local SQLite storage with per-user DPAPI-encrypted secrets, search, copy, and tray controls. Camera scanning uses a browser and may download jsQR from jsDelivr. No Windows Hello, inactivity lock, installer, automatic updates, or portable account backup.
+
+          CI verified the extracted Windows x64 package starts and creates its WPF main window. Camera hardware and complete OTP workflows were not exercised by this smoke test.
+
+          See the [README and architecture decisions](https://github.com/${GH_REPO}/tree/${RELEASE_TAG}#readme) for usage and security boundaries.
+          EOF
+          gh release create "$RELEASE_TAG" "WindowsOtpManager-${RELEASE_TAG}-win-x64.zip" SHA256SUMS \
+            --verify-tag --draft --title "Windows OTP Manager ${RELEASE_TAG}" \
+            --notes-file release-notes.md --generate-notes
+          gh release edit "$RELEASE_TAG" --draft=false --latest
