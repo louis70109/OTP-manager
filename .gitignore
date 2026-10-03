@@ -5,6 +5,8 @@ Data/
 .dotnet-home/
 .nuget/
 .vs/
+artifacts/
+.dotnet-cli/
 *.db
 *.sqlite
 *.sqlite3
